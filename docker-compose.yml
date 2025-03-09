@@ -1,0 +1,48 @@
+version: '3'
+
+services:
+  presign-service:
+    build: .
+    container_name: r2-presign-service
+    restart: always
+    ports:
+      - "3005:3005"
+    environment:
+      - NODE_ENV=production
+      - PORT=3005
+      # R2 配置
+      - R2_ACCOUNT_ID=${R2_ACCOUNT_ID}
+      - R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}
+      - R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}
+      - R2_BUCKET_NAME=${R2_BUCKET_NAME}
+      - R2_PUBLIC_URL=${R2_PUBLIC_URL}
+      # CORS 配置
+      - CORS_ORIGINS=${CORS_ORIGINS}
+      - CORS_METHODS=${CORS_METHODS}
+      - CORS_MAX_AGE=${CORS_MAX_AGE}
+      # 上传配置
+      - MAX_FILE_SIZE=${MAX_FILE_SIZE}
+      - ALLOWED_FILE_TYPES=${ALLOWED_FILE_TYPES}
+      - CACHE_CONTROL=${CACHE_CONTROL}
+      # 日志配置
+      - LOG_LEVEL=${LOG_LEVEL}
+    volumes:
+      - /mydata/R2/logs:/app/logs
+      - .env:/app/.env:ro
+    networks:
+      - fiora-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3005/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+networks:
+  fiora-network:
+    external: true
