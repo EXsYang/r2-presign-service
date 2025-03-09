@@ -20,10 +20,8 @@ app.use((req, res, next) => {
 // 配置 CORS
 const corsOptions = {
     origin: process.env.CORS_ORIGINS?.split(',') || [
-        'https://r2.vrchat.vip',
-        'http://r2.vrchat.vip',
-        'https://vrchat.vip',
-        'http://vrchat.vip',
+        'http://example.com',
+        'https://example.com',
         'http://localhost:8080',
     ],
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
