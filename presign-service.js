@@ -20,9 +20,12 @@ app.use((req, res, next) => {
 // 配置 CORS
 const corsOptions = {
     origin: process.env.CORS_ORIGINS?.split(',') || [
-        'http://example.com',
-        'https://example.com',
+        'https://r2.vrchat.vip',
+        'http://r2.vrchat.vip',
+        'https://vrchat.vip',
+        'http://vrchat.vip',
         'http://localhost:8080',
+        // '*' // 临时添加通配符以允许所有来源（开发环境用）
     ],
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: [
@@ -32,7 +35,8 @@ const corsOptions = {
         'Accept',
         'Origin',
         'Range',
-        'Content-Range'
+        'Content-Range',
+        'Cache-Control' // 添加这一行，缺少这个头部会导致问题
     ],
     exposedHeaders: [
         'ETag',
@@ -41,10 +45,15 @@ const corsOptions = {
         'Accept-Ranges'
     ],
     credentials: true,
-    maxAge: 86400
+    maxAge: 86400,
+    preflightContinue: false,  // 确保预检请求正确处理
+    optionsSuccessStatus: 204  // 设置预检请求的成功状态码
 };
 
 app.use(cors(corsOptions));
+
+// 添加一个专门处理 OPTIONS 请求的中间件
+app.options('*', cors(corsOptions));
 
 // 创建 R2 客户端，增加超时设置
 const s3Client = new S3Client({
@@ -110,6 +119,17 @@ function generateSafeFileName(originalFileName, category) {
     }
 }
 
+
+// 辅助函数：通过代理包装 URL
+function proxyUrl(originalUrl) {
+    const corsProxyBaseUrl = process.env.CORS_PROXY_URL || 'https://vrchat.vip/r2-cors-proxy';
+    // 确保 originalUrl 不以 / 开头，而 corsProxyBaseUrl 以 / 结尾
+    const formattedProxyUrl = corsProxyBaseUrl.endsWith('/') ? corsProxyBaseUrl : `${corsProxyBaseUrl}/`;
+    return `${formattedProxyUrl}${originalUrl}`;
+}
+
+
+
 // 初始化分片上传
 app.post('/init-multipart-upload', async (req, res) => {
     try {
@@ -160,6 +180,7 @@ app.post('/init-multipart-upload', async (req, res) => {
 });
 
 // 获取分片上传URL
+// 获取分片上传URL
 app.post('/get-part-upload-url', async (req, res) => {
     try {
         const { key, uploadId, partNumber } = req.body;
@@ -175,8 +196,24 @@ app.post('/get-part-upload-url', async (req, res) => {
             expiresIn: 3600 * 24 // 24小时有效期
         });
         
+        // 辅助函数：通过代理包装 URL
+        function proxyUrl(originalUrl) {
+            // 不要对原始URL进行编码，因为它已经是预签名的
+            const corsProxyBaseUrl = process.env.CORS_PROXY_URL || 'https://vrchat.vip/r2-cors-proxy';
+            // 直接拼接，不做额外编码
+            return `${corsProxyBaseUrl}/${originalUrl}`;
+        }
+        
+        // 使用代理包装签名URL
+        const uploadUrl = proxyUrl(signedUrl);
+        
+        // 记录URL便于调试
+        console.log(`[${new Date().toISOString()}] 分片 ${partNumber} 原始预签名URL: ${signedUrl}`);
+        console.log(`[${new Date().toISOString()}] 分片 ${partNumber} 代理后URL: ${uploadUrl}`);
+
         res.json({
-            signedUrl,
+            uploadUrl,  // 添加这个，使用与普通上传相同的键名
+            signedUrl: uploadUrl,  // 保持兼容性
             partNumber,
             config: {
                 timeout: 300000, // 5分钟超时
@@ -184,11 +221,16 @@ app.post('/get-part-upload-url', async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('获取分片上传URL错误:', error);
+        console.error('获取分片上��URL错误:', error);
         res.status(500).json({ error: '获取上传URL失败' });
     }
 });
 
+
+
+
+
+ 
 // 完成分片上传
 app.post('/complete-multipart-upload', async (req, res) => {
     try {
@@ -215,6 +257,107 @@ app.post('/complete-multipart-upload', async (req, res) => {
         res.status(500).json({ error: '完成上传失败' });
     }
 });
+
+
+// 在 presign-service.js 中添加服务器端分片上传函数
+// 服务器端分片上传（作为备用方案）
+app.post('/server-upload-large-file', async (req, res) => {
+    try {
+        const { fileData, fileName, fileType, category } = req.body;
+        
+        if (!fileData || !fileName) {
+            return res.status(400).json({ error: '缺少必要参数' });
+        }
+        
+        console.log(`[${new Date().toISOString()}] 开始服务器端上传大文件: ${fileName}`);
+        
+        // 解码 base64 数据
+        let buffer;
+        if (fileData.startsWith('data:')) {
+            const base64Data = fileData.split(',')[1];
+            buffer = Buffer.from(base64Data, 'base64');
+        } else {
+            buffer = Buffer.from(fileData, 'base64');
+        }
+        
+        // 生成文件名
+        const fileNameResult = generateSafeFileName(fileName, category || 'FileMessage');
+        const uniqueFileName = fileNameResult.key;
+        
+        // 初始化分片上传
+        const initCommand = new CreateMultipartUploadCommand({
+            Bucket: process.env.R2_BUCKET_NAME,
+            Key: uniqueFileName,
+            ContentType: fileType || 'application/octet-stream',
+            ACL: 'public-read',
+            CacheControl: 'public, max-age=31536000',
+            Metadata: {
+                'original-filename': Buffer.from(JSON.stringify(fileNameResult.originalNameInfo)).toString('base64')
+            }
+        });
+        
+        const { UploadId } = await s3Client.send(initCommand);
+        console.log(`[${new Date().toISOString()}] 服务器初始化分片上传: ${uniqueFileName}, uploadId: ${UploadId}`);
+        
+        // 分片上传
+        const chunkSize = 5 * 1024 * 1024; // 5MB
+        const chunks = Math.ceil(buffer.length / chunkSize);
+        const parts = [];
+        
+        for (let i = 0; i < chunks; i++) {
+            const partNumber = i + 1;
+            const start = i * chunkSize;
+            const end = Math.min(buffer.length, start + chunkSize);
+            const chunk = buffer.slice(start, end);
+            
+            const uploadCommand = new UploadPartCommand({
+                Bucket: process.env.R2_BUCKET_NAME,
+                Key: uniqueFileName,
+                UploadId,
+                PartNumber: partNumber,
+                Body: chunk
+            });
+            
+            try {
+                const { ETag } = await s3Client.send(uploadCommand);
+                parts.push({
+                    PartNumber: partNumber,
+                    ETag
+                });
+                console.log(`[${new Date().toISOString()}] 服务器上传分片 ${partNumber}/${chunks} 成功`);
+            } catch (error) {
+                console.error(`[${new Date().toISOString()}] 服务器上传分片 ${partNumber} 失败:`, error);
+                throw error;
+            }
+        }
+        
+        // 完成上传
+        const completeCommand = new CompleteMultipartUploadCommand({
+            Bucket: process.env.R2_BUCKET_NAME,
+            Key: uniqueFileName,
+            UploadId,
+            MultipartUpload: {
+                Parts: parts
+            }
+        });
+        
+        await s3Client.send(completeCommand);
+        console.log(`[${new Date().toISOString()}] 服务器完成分片上传: ${uniqueFileName}`);
+        
+        res.json({
+            success: true,
+            fileUrl: `${process.env.R2_PUBLIC_URL}${uniqueFileName}`
+        });
+    } catch (error) {
+        console.error(`[${new Date().toISOString()}] 服务器上传大文件失败:`, error);
+        res.status(500).json({ error: `上传大文件失败: ${error.message}` });
+    }
+});
+
+
+
+
+
 
 // 获取普通上传URL（小文件用）
 app.post('/get-upload-url', async (req, res) => {
@@ -243,14 +386,20 @@ app.post('/get-upload-url', async (req, res) => {
             }
         });
         
+
         const signedUrl = await getSignedUrl(s3Client, command, {
             expiresIn: 3600 * 24 // 24小时有效期
         });
+
+        // 使用代理包装 URL
+        const uploadUrl = proxyUrl(signedUrl);
         
-        console.log(`[${new Date().toISOString()}] 生成普通上传URL: ${uniqueFileName}`);
+        // 记录URL便于调试
+        console.log(`[${new Date().toISOString()}] 原始预签名URL: ${signedUrl}`);
+        console.log(`[${new Date().toISOString()}] 代理后URL: ${uploadUrl}`);
         
         res.json({
-            uploadUrl: signedUrl,
+            uploadUrl: uploadUrl,
             fileUrl: `${process.env.R2_PUBLIC_URL}${uniqueFileName}`,
             key: uniqueFileName,
             originalNameInfo: fileNameResult.originalNameInfo,
@@ -327,7 +476,7 @@ app.get('/download/:key(*)', async (req, res) => {
         if (metadata.Metadata && metadata.Metadata['original-filename']) {
             try {
                 const originalNameInfo = JSON.parse(Buffer.from(metadata.Metadata['original-filename'], 'base64').toString());
-                // 重建原始文件名（不包含时间戳）
+                // 重建原始文件名（不包含时间戳��
                 if (originalNameInfo.extension) {
                     originalFilename = `${originalNameInfo.originalName}.${originalNameInfo.extension}`;
                 } else {
@@ -349,6 +498,11 @@ app.get('/download/:key(*)', async (req, res) => {
         const signedUrl = await getSignedUrl(s3Client, getCommand, {
             expiresIn: 3600 // 1小时有效期
         });
+
+        // 使用代理包装 URL
+        // const downloadUrl = proxyUrl(signedUrl);
+        // console.log(`[${new Date().toISOString()}] 使用CORS代理获取文件: ${downloadUrl}`);
+        // 下载不用代理包装，因为下载没有遇到跨域CORS
         
         // 重定向到签名URL
         res.redirect(signedUrl);
